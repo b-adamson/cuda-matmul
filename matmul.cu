@@ -58,9 +58,7 @@ __global__ void matmul_tiled(const float* A, const float* B, float* C, int N) {
         __syncthreads();
     }
 
-    C[row*N + col] = sum;
-
-    
+    C[row*N + col] = sum;   
 }
 
 // ------------------------------------------------------------------ bytes
@@ -69,8 +67,8 @@ __global__ void matmul_tiled(const float* A, const float* B, float* C, int N) {
 // Not how many it *needs* — how many it issues. Think about how many times a
 // single element of A is re-read across all threads. This number is the whole
 // point of the exercise; derive it before you measure anything.
-static double bytes_naive(int N) { return 0.0; }
-static double bytes_tiled(int N) { return 0.0; }
+static double bytes_naive(int N) { return 2.0 * N * N * N * 4; }
+static double bytes_tiled(int N) { return 2.0 * N * N * N / TILE * 4; }
 
 // ----------------------------------------------------------------- harness
 
