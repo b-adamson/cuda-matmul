@@ -35,6 +35,32 @@ __global__ void matmul_naive(const float* A, const float* B, float* C, int N) {
 // its operands from there. Loop over N/TILE phases. You will need two
 // __syncthreads() per phase — think about why, and what breaks without each.
 __global__ void matmul_tiled(const float* A, const float* B, float* C, int N) {
+
+
+    float sum = 0.0f;
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+
+    int tx = threadIdx.x;                     
+    int ty = threadIdx.y;                      
+
+    int col = blockIdx.x * TILE + tx;           
+    int row = blockIdx.y * TILE + ty;              
+
+    for (int t = 0; t < N/TILE; ++t) {
+        As[ty][tx] = A[row*N + t*TILE + tx];
+        Bs[ty][tx] = B[t*TILE*N + ty*N + col];
+
+        __syncthreads();
+        for (int k = 0; k < TILE; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+        __syncthreads();
+    }
+
+    C[row*N + col] = sum;
+
+    
 }
 
 // ------------------------------------------------------------------ bytes
