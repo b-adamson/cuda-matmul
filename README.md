@@ -24,8 +24,8 @@ kernel — it is being able to say *why* one is faster, with numbers.
 | | |
 |---|---|
 | GPU | RTX A6000 (sm_86) |
-| Peak FP32 | ~38.7 TFLOP/s (from spec sheet, verify) |
-| Peak bandwidth | 768 GB/s (from spec sheet, verify) |
+| Peak FP32 | 38.7 TFLOP/s (NVIDIA datasheet, at 1800 MHz boost) |
+| Peak bandwidth | 768 GB/s (NVIDIA datasheet, 384-bit GDDR6) |
 
 ## Results
 
