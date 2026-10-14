@@ -3,7 +3,7 @@ ARCH  ?= -arch=sm_86          # RTX A6000 is sm_86; 4090/L4 = sm_89, A100 = sm_8
 FLAGS  = $(ARCH) -O3 -lineinfo -Xcompiler -Wall
 
 matmul: matmul.cu
-	$(NVCC) $(FLAGS) $< -o $@
+	$(NVCC) $(FLAGS) $< -o $@ -lcublas
 
 run: matmul
 	./matmul

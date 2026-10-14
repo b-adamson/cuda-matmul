@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cublas_v2.h>
 
 #define CHECK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
     printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); \
@@ -118,6 +119,36 @@ static float time_kernel(Kernel k, const float* dA, const float* dB, float* dC,
     return ms / iters;
 }
 
+// cuBLAS baseline. cuBLAS is column-major and our matrices are row-major, so
+// we ask for C^T = B^T * A^T: passing B first and A second gives a column-major
+// result that is exactly our row-major C.
+static float time_cublas(cublasHandle_t h, const float* dA, const float* dB,
+                         float* dC, int N, int iters) {
+    const float alpha = 1.0f, beta = 0.0f;
+    auto gemm = [&]() {
+        cublasStatus_t s = cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N,
+                                       &alpha, dB, N, dA, N, &beta, dC, N);
+        if (s != CUBLAS_STATUS_SUCCESS) { printf("cuBLAS error %d\n", (int)s); exit(1); }
+    };
+
+    gemm();                                   // warm up
+    CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t t0, t1;
+    CHECK(cudaEventCreate(&t0));
+    CHECK(cudaEventCreate(&t1));
+    CHECK(cudaEventRecord(t0));
+    for (int i = 0; i < iters; ++i) gemm();
+    CHECK(cudaEventRecord(t1));
+    CHECK(cudaEventSynchronize(t1));
+
+    float ms = 0.0f;
+    CHECK(cudaEventElapsedTime(&ms, t0, t1));
+    CHECK(cudaEventDestroy(t0));
+    CHECK(cudaEventDestroy(t1));
+    return ms / iters;
+}
+
 static void report(const char* name, float ms, double bytes, int N) {
     double secs   = ms / 1e3;
     double gflops = (2.0 * N * N * N / secs) / 1e9;
@@ -163,7 +194,18 @@ int main(int argc, char** argv) {
         report(r.name, ms, r.bytes(N), N);
     }
 
-    printf("\nA6000 peak: check the spec sheet and fill it into the README.\n");
+    // cuBLAS baseline. Its GB/s uses the minimum traffic (A and B read once),
+    // since we don't know what it actually issues.
+    cublasHandle_t handle;
+    if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) { printf("cublasCreate failed\n"); return 1; }
+    CHECK(cudaMemset(dC, 0, bytes));
+    float ms = time_cublas(handle, dA, dB, dC, N, 10);
+    CHECK(cudaMemcpy(hC, dC, bytes, cudaMemcpyDeviceToHost));
+    if (check && !verify(hC, hRef, N)) printf("  cublas: WRONG\n");
+    else report("cublas", ms, 2.0 * N * N * sizeof(float), N);
+    cublasDestroy(handle);
+
+    printf("\nA6000 peak: 38.7 TFLOP/s FP32, 768 GB/s (see README).\n");
 
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
     free(hA); free(hB); free(hC); free(hRef);
