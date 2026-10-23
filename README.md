@@ -1,5 +1,20 @@
 # cuda-matmul
 
+**Current target (23 October 2026): Tesla T4 / sm_75 on Google Colab.**
+See [the T4 baseline protocol](docs/T4.md) for current build commands,
+correctness checks, repeatable event timing, persistent results and profiling.
+Start with `make` and `python3 scripts/baseline.py --ncu` on the T4.
+No T4 measurements have been collected by the new harness yet.
+
+The material below is the **historical A6000 experiment**. Its shared-memory
+ceiling is an unvalidated model that overcounts broadcast traffic; its profiling
+restriction does not apply to every Colab runtime (counter access was demonstrated
+by the project author). Low throughput alone also cannot establish whether cuBLAS
+used Tensor Cores. The new harness explicitly selects pedantic FP32 math.
+The default build now targets sm_75, the active kernels handle partial tiles,
+and the active harness checks correctness at every size. Preserve the original
+build target with `make ARCH=-arch=sm_86` when revisiting the A6000.
+
 Naive vs shared-memory-tiled matrix multiply, measured. The point is not the
 kernel — it is being able to say *why* one is faster, with numbers.
 
