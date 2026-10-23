@@ -3,3 +3,4 @@ matmul
 *.ncu-rep
 *.nsys-rep
 *.sqlite
+__pycache__/
