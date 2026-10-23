@@ -1,159 +1,96 @@
 # cuda-matmul
 
-**Current target (23 October 2026): Tesla T4 / sm_75 on Google Colab.**
-See [the T4 baseline protocol](docs/T4.md) for current build commands,
-correctness checks, repeatable event timing, persistent results and profiling.
-Start with `make` and `python3 scripts/baseline.py --ncu` on the T4.
-No T4 measurements have been collected by the new harness yet.
+Single-precision square matrix multiplication (`C = A * B`, row-major) on a
+Tesla T4, with three hand-written CUDA kernels benchmarked against cuBLAS and
+profiled with Nsight Compute to explain where each one is limited.
 
-The material below is the **historical A6000 experiment**. Its shared-memory
-ceiling is an unvalidated model that overcounts broadcast traffic; its profiling
-restriction does not apply to every Colab runtime (counter access was demonstrated
-by the project author). Low throughput alone also cannot establish whether cuBLAS
-used Tensor Cores. The new harness explicitly selects pedantic FP32 math.
-The default build now targets sm_75, the active kernels handle partial tiles,
-and the active harness checks correctness at every size. Preserve the original
-build target with `make ARCH=-arch=sm_86` when revisiting the A6000.
-
-Naive vs shared-memory-tiled matrix multiply, measured. The point is not the
-kernel — it is being able to say *why* one is faster, with numbers.
-
-## Build
-
-    make                 # edit ARCH in the Makefile for a different card
-    ./matmul 512         # small: verifies against a CPU reference
-    ./matmul 1024        # measurement size
-
-## Method
-
-1. Write the naive kernel. Verify at N=512 before believing any timing.
-2. Derive, on paper, how many bytes it reads from global memory. Fill in
-   `bytes_naive`. Do this *before* running it.
-3. Measure. Compare achieved GFLOP/s and GB/s against the card's peak.
-   Whichever is closer to peak is the bottleneck.
-4. Write the tiled kernel. Derive its byte count. Measure again.
-5. Explain the ratio between the two.
-
-## Card
-
-| | |
+| kernel | what it does |
 |---|---|
-| GPU | RTX A6000 (sm_86) |
-| Peak FP32 | 38.7 TFLOP/s (NVIDIA datasheet, at 1800 MHz boost) |
-| Peak bandwidth | 768 GB/s (NVIDIA datasheet, 384-bit GDDR6) |
+| `naive` | one thread per output element, operands from global memory |
+| `tiled` | 16x16 shared-memory tiles, one output element per thread |
+| `regtiled` | 64x64x8 shared-memory tiles, 4x4 outputs per thread held in registers |
+| `cublas` | `cublasSgemm`, pedantic FP32 math (no Tensor Cores) |
 
 ## Results
 
-All on the RTX A6000. `% of peak` is against 38.7 TFLOP/s FP32.
+Tesla T4 (Google Colab), CUDA 13.0, median of 5 samples of 10 launches.
+TFLOP/s counts `2*N^3` FLOPs.
 
-| kernel | N | ms | GFLOP/s | % of peak | % of cuBLAS |
-|---|---|---|---|---|---|
-| naive  | 1024 |  0.912 |  2355 | 6.1% | 12.8% |
-| tiled  | 1024 |  0.703 |  3053 | 7.9% | 16.6% |
-| cuBLAS | 1024 |  0.117 | 18430 | 47.6% | 100% |
-| naive  | 2048 |  7.659 |  2243 | 5.8% |  9.4% |
-| tiled  | 2048 |  5.907 |  2909 | 7.5% | 12.2% |
-| cuBLAS | 2048 |  0.719 | 23900 | 61.8% | 100% |
-| naive  | 4096 | 62.771 |  2190 | 5.7% |  8.8% |
-| tiled  | 4096 | 46.678 |  2944 | 7.6% | 11.8% |
-| cuBLAS | 4096 |  5.516 | 24915 | 64.4% | 100% |
+| N | naive | tiled | regtiled | cuBLAS |
+|---|---:|---:|---:|---:|
+| 512  | 0.57 | 0.89 | 1.98 | 5.00 |
+| 1024 | 0.50 | 0.81 | 2.26 | 5.62 |
+| 2048 | 0.44 | 0.69 | 2.17 | 4.33 |
+| 4096 | 0.44 | 0.67 | 2.05 | 4.23 |
 
-cuBLAS is `cublasSgemm` on the same matrices (row-major handled by swapping the
-operands), timed identically and checked against the CPU reference at N=512. At
-18-25 TFLOP/s it is below the 38.7 TFLOP/s FP32 peak, so tensor cores do not
-appear to be involved and it is a like-for-like baseline. Results above N=512
-are timings only; correctness is checked at N=512.
+At N=4096, `regtiled` reaches 48% of cuBLAS (`tiled` 16%, `naive` 10%).
+All values come from one run in which the GPU was power-throttled (mean SM clock
+1110 MHz against a 1590 MHz boost, at 68.6 W of a 70 W cap), so the nominal
+8.1 TFLOP/s peak is not attainable; the FP32 limit at the observed clock is
+about 5.7 TFLOP/s. Treat ratios between kernels as more reliable than absolute
+rates, and see [Limitations](#limitations).
 
-## What I predicted, and what actually happened
+## Findings
 
-**Prediction 1 (wrong): tiling would give ~16x**, since it issues 1/TILE as many
-global loads. It gave 1.29x.
+1. **Shared-memory tiling alone gives 1.5-1.6x over naive.** It issues 1/16 as
+   many global loads, but both kernels are limited by the L1/TEX unit (91% and
+   95% busy), not the FMA pipes. For `tiled` the profile also rules out DRAM
+   (72 GB/s of 320), L2 (15%) and occupancy (98.7%). Naive saturates L1/TEX through the global-load queue, tiled
+   through the shared-memory path (49.7% of tiled's warp stall samples are MIO
+   throttle).
+2. **Register tiling gives 2.2-3.2x over `tiled`** (2.8-3.2x for N of 1024 and up). Shared-load instructions per
+   FMA fall from 1.25 to 0.32, L1/TEX utilisation drops to 66%, and the largest
+   stall becomes waiting on the global loads that fill the tiles (long
+   scoreboard, 48% of the sampled reasons).
+3. **cuBLAS is 2.1-2.5x faster than `regtiled`** and its throughput falls as N
+   grows, consistent with the clock throttling above.
 
-**Prediction 2 (wrong): the naive kernel was surviving because the matrices fit
-in L2.** Growing N past the 6 MB of L2 should then make it collapse. It did not:
-naive went 2355 -> 2243 -> 2190 GFLOP/s across a 64x increase in data (each
-matrix is 64 MB at N=4096).
+Details and data: [docs/profile-analysis.md](docs/profile-analysis.md),
+[results/t4-run-001/](results/t4-run-001/).
 
-### What the flatness means
+## Reproduce
 
-A kernel limited by data volume should degrade as the data outgrows the caches.
-Naive is flat across 64x of data, and the naive-to-tiled gap is only 1.3x
-despite a 16x difference in issued global loads. Both point to a cost that is
-fixed *per operation* and independent of problem size, not to data volume.
+On a Colab T4 runtime (check `nvidia-smi` shows a Tesla T4):
 
-My working explanation is the ratio of **loads to FMAs** in the inner loop:
+    git clone https://github.com/b-adamson/cuda-matmul.git
+    cd cuda-matmul
+    make ARCH=-arch=sm_75
+    ./matmul 65 all 1 1                       # quick correctness check on awkward sizes
+    python3 scripts/baseline.py --ncu --output /content/drive/MyDrive/cuda-matmul/run-001
 
-| kernel | FMAs | loads per FMA | loads served from |
-|---|---|---|---|
-| naive  | N^3 | 2 | global, mostly hitting L1/L2 |
-| tiled  | N^3 | 2 | shared memory |
-| cuBLAS | N^3 | well below 2 (not measured) | registers, presumably |
+The runner validates every kernel against cuBLAS and a double-precision CPU
+oracle at 13 small sizes, then times N=512-4096 and profiles `tiled`. To profile
+the other kernels:
 
-All three do the same N^3 FMAs. Tiling changed where the loads come from, not
-how many there are per FMA, which is why a 16x reduction in global loads bought
-only 29%. Shared memory is a cheaper place to load from; it is not fewer loads.
+    ncu --set full --clock-control none --cache-control all --launch-count 1 \
+        --export regtiled ./matmul --profile regtiled 1024
 
-### A rough ceiling for tiled
+Full protocol, artifact list and validation details: [docs/T4.md](docs/T4.md).
+Other GPUs: `make ARCH=-arch=sm_XX`. Python tests (no GPU needed):
+`python3 -m unittest discover -s tests`.
 
-Shared memory serves 32 banks x 4 bytes = 128 bytes per cycle per SM (to be
-checked against NVIDIA's documentation before quoting). At 2 shared loads per
-FMA that is 8 bytes per FMA, so 16 FMAs/cycle/SM = 32 FLOP/cycle/SM:
+## Limitations
 
-    84 SMs x 32 FLOP/cycle x 1.8 GHz = 4.8 TFLOP/s
+- One timing run on one power-throttled Colab T4. Kernels run in a fixed order,
+  so clock drift can bias the ratios; cuBLAS at N=2048 varied by 50% between
+  samples. Repeat runs have not been done.
+- One profile launch per kernel at N=1024, with unfixed clocks. The saturated
+  sub-unit inside L1/TEX has not been identified, the vectorised-load inference
+  has not been checked in the SASS, and the stall shares for `naive` and
+  `regtiled` cover only seven extracted reasons.
+- Results above N=512 are checked against cuBLAS in full but against the CPU
+  oracle only at 32 sampled outputs.
+- Tile sizes were chosen once and not tuned. Vectorised loads, double buffering
+  and Tensor Cores have not been tried.
 
-Measured tiled is about 2.9 TFLOP/s, roughly 60% of that bound, with the rest
-plausibly going to loop overhead, two `__syncthreads()` per phase and the serial
-dependency on `sum`. The FP32 pipes could do 38.7 TFLOP/s, so the FMA units are
-idle ~92% of the time waiting for operands. The arithmetic is not the
-bottleneck; feeding it is.
+## Layout
 
-### Why cuBLAS rises with N and mine do not
-
-cuBLAS goes 18.4 -> 23.9 -> 24.9 TFLOP/s. A plausible reason is that at N=1024
-it cannot fully saturate 84 SMs and launch and tail effects are a larger share
-of a short run, so growing N amortises them away. Mine are flat because they
-sit at a low ceiling from the start, and more work cannot lift it.
-
-### The earlier "9.4 TB/s issued" figure was counted at the wrong level
-
-In the naive kernel a warp's 32 threads read `A[row*N+k]`, the same address,
-which is one broadcast and not 32 loads. `B[k*N+col]` is 32 consecutive floats,
-which coalesce into a handful of transactions. `bytes_naive` is a thread-level
-count; the memory system sees a small fraction of it. The ">12x DRAM bandwidth"
-reading is therefore partly an artefact of counting at the wrong level, as well
-as of cache hits.
-
-No bank conflicts arise in the tiled kernel: `As[ty][k]` is the same address for
-all threads sharing a `ty` (broadcast), and `Bs[k][tx]` spans 16 distinct banks.
-
-The tiled kernel has no bounds guard and `N/TILE` truncates, so it is only
-correct when N is a multiple of TILE. 512, 1024, 2048 and 4096 all are.
-
-## Next: register tiling
-
-Give each thread a TM x TN patch of output instead of one element. Per k-step it
-loads TM values of A and TN of B into registers, then does the TM x TN outer
-product. At 4x4 that is 8 loads for 16 FMAs, 0.5 loads per FMA, down from 2.
-Identical arithmetic, a quarter of the loads.
-
-**Prediction to test (written before building it):** the shared-bandwidth
-ceiling moves from 4.8 to roughly 19 TFLOP/s. If the model is right, a 4x4
-register-tiled kernel should land in the 10-19 TFLOP/s range, i.e. 40-75% of
-cuBLAS, up from ~12%.
-
-## Open question for the profiler
-
-Flatness across N is also consistent with being limited by L2 bandwidth rather
-than by load-issue rate. The 1.3x naive-to-tiled ratio argues against pure L2
-bandwidth, but timings alone cannot fully separate the two. First thing to check
-with `ncu`. Other hypotheses: shared-memory throughput, latency from the single
-accumulator per thread, and occupancy.
-
-## Profiling (later)
-
-Nsight Compute needs GPU performance counters, which containerised providers
-(RunPod, Colab) do not grant — `ERR_NVGPUCTRPERM`. The restriction is a driver
-kernel-module setting on the host, so no container can lift it. Needs a VM or
-bare metal with root on the host, or a department machine.
-
-    ncu --set full ./matmul 1024
+| path | purpose |
+|---|---|
+| `matmul.cu` | the three kernels |
+| `baseline.cuh` | harness: validation, event timing, `--profile` mode |
+| `scripts/baseline.py` | runs the harness and records results, telemetry and metadata |
+| `tests/` | tests for the runner's validation logic |
+| `docs/T4.md` | measurement and profiling protocol |
+| `docs/profile-analysis.md` | interpretation of the Nsight Compute profiles |
+| `results/t4-run-001/` | timing summary and extracted profile metrics |

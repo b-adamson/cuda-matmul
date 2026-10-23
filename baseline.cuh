@@ -1,4 +1,4 @@
-// Active T4 harness. The historical A6000 harness remains in matmul.cu.
+// Benchmark and validation harness for the kernels in matmul.cu (included from there).
 #include <algorithm>
 #include <cerrno>
 #include <climits>
